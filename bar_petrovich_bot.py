@@ -10,6 +10,7 @@
 """
 
 import os
+import re
 import json
 import time
 import random
@@ -19,6 +20,8 @@ import feedparser
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН_ОТ_BOTFATHER")
@@ -45,6 +48,36 @@ def save_posted(posted):
         json.dump(list(posted)[-500:], f, ensure_ascii=False)
 
 
+def clean_title(title):
+    """Убирает хвост вида ' - Источник' или ' – Источник' из заголовка Google News."""
+    return re.split(r"\s[-–]\s(?=[^-–]*$)", title)[0].strip()
+
+
+def resolve_real_url(google_link):
+    """Разворачивает редирект Google News до настоящего адреса статьи."""
+    try:
+        resp = requests.get(google_link, headers=HEADERS, timeout=8, allow_redirects=True)
+        return resp.url
+    except Exception:
+        return google_link
+
+
+def find_image(article_url):
+    """Пытается найти og:image на странице статьи."""
+    try:
+        resp = requests.get(article_url, headers=HEADERS, timeout=8)
+        match = re.search(
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            resp.text,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1)
+    except Exception as e:
+        logging.info(f"Не удалось получить картинку: {e}")
+    return None
+
+
 def fetch_news():
     posted = load_posted()
     candidates = []
@@ -59,7 +92,7 @@ def fetch_news():
             link = entry.link
             if link not in posted:
                 candidates.append({
-                    "title": entry.title,
+                    "title": clean_title(entry.title),
                     "link": link,
                 })
     random.shuffle(candidates)
@@ -67,7 +100,24 @@ def fetch_news():
 
 
 def send_to_channel(item):
-    text = f"🍺 <b>{item['title']}</b>\n\n{item['link']}"
+    text = f"🍺 <b>{item['title']}</b>"
+
+    real_url = resolve_real_url(item["link"])
+    image_url = find_image(real_url)
+
+    if image_url:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+        resp = requests.post(url, data={
+            "chat_id": CHANNEL,
+            "photo": image_url,
+            "caption": text,
+            "parse_mode": "HTML",
+        })
+        if resp.ok:
+            logging.info(f"Опубликовано с картинкой: {item['title']}")
+            return True
+        logging.warning(f"Не получилось отправить с картинкой, пробую без: {resp.text}")
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     resp = requests.post(url, data={
         "chat_id": CHANNEL,
