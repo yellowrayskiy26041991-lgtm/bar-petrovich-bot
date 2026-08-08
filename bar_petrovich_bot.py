@@ -53,9 +53,9 @@ QUERIES = ["пиво новости", "craft beer news", "пивоварня", "
 
 YOUTUBE_QUERIES = ["beer shorts", "craft beer", "beer review shorts"]
 
-DRAFT_HOUR = 9        # во сколько бот сам присылает пачку черновиков
-NUM_DRAFTS = 5        # сколько новостей готовить за раз
-NUM_VIDEO_DRAFTS = 2  # сколько видео добавлять к пачке
+DRAFT_HOURS = [9, 18]  # во сколько бот сам присылает пачку черновиков (можно несколько раз в день)
+NUM_DRAFTS = 5          # сколько новостей готовить за раз
+NUM_VIDEO_DRAFTS = 4    # сколько видео добавлять к пачке
 DESCRIPTION_MAX_LEN = 700
 # ========================
 
@@ -534,18 +534,24 @@ def poll_updates():
 
 def main():
     logging.info("Бот 'Барный Петрович' запущен")
-    last_draft_date = None
+    current_day = None
+    sent_hours_today = set()
 
     while True:
         now = datetime.now()
 
-        if now.hour == DRAFT_HOUR and last_draft_date != now.date():
+        if current_day != now.date():
+            current_day = now.date()
+            sent_hours_today = set()
+
+        if now.hour in DRAFT_HOURS and now.hour not in sent_hours_today:
             send_drafts()
-            last_draft_date = now.date()
+            sent_hours_today.add(now.hour)
 
         poll_updates()  # тут же ловим долгий poll (до 20 сек), поэтому отдельный sleep не нужен
 
 
 if __name__ == "__main__":
     main()
+
 
