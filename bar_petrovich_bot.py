@@ -52,7 +52,7 @@ QUERIES = ["пиво новости", "craft beer news", "пивоварня", "
 
 DRAFT_HOUR = 9     # во сколько бот сам присылает пачку черновиков
 NUM_DRAFTS = 5     # сколько черновиков готовить за раз
-DESCRIPTION_MAX_LEN = 400
+DESCRIPTION_MAX_LEN = 700
 # ========================
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -97,9 +97,19 @@ def strip_html(text):
 def clean_text(text, max_len=None):
     text = html.unescape(strip_html(text))
     text = re.sub(r"\s+", " ", text).strip()
-    if max_len and len(text) > max_len:
-        text = text[:max_len].rsplit(" ", 1)[0] + "…"
-    return text
+    if not max_len or len(text) <= max_len:
+        return text
+
+    cut = text[:max_len]
+    # ищем последнюю точку конца предложения (. ! ?) в пределах лимита
+    match = None
+    for m in re.finditer(r"[.!?](?:\s|$)", cut):
+        match = m
+    if match:
+        return cut[:match.end()].strip()
+
+    # если законченного предложения нет вообще — обрезаем по границе слова с многоточием
+    return cut.rsplit(" ", 1)[0].strip() + "…"
 
 
 def clean_title(title):
@@ -465,5 +475,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
