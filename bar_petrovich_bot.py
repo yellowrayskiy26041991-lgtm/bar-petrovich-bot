@@ -16,6 +16,7 @@ import os
 import re
 import json
 import time
+import base64
 import random
 import logging
 import requests
@@ -81,10 +82,28 @@ def clean_title(title):
     return re.split(r"\s[-–]\s(?=[^-–]*$)", title)[0].strip()
 
 
+def decode_google_news_url(google_link):
+    """Google News кодирует настоящий адрес статьи в base64 прямо в самой ссылке
+    (после /articles/). Пытаемся вытащить его напрямую, без похода на сайт."""
+    try:
+        path = google_link.split("/articles/")[-1].split("?")[0]
+        padded = path + "=" * (-len(path) % 4)
+        decoded_bytes = base64.urlsafe_b64decode(padded)
+        decoded = decoded_bytes.decode("latin-1", errors="ignore")
+        match = re.search(r'https?://[^\s\x00-\x1f"\\]+', decoded)
+        if match:
+            return match.group(0)
+    except Exception:
+        pass
+    return None
+
+
 def resolve_real_url(google_link):
-    """Разворачивает ссылку Google News до настоящего адреса статьи.
-    Google News отдаёт промежуточную страницу с редиректом через meta-refresh
-    или JS, поэтому обычного HTTP-редиректа requests недостаточно."""
+    """Разворачивает ссылку Google News до настоящего адреса статьи."""
+    decoded = decode_google_news_url(google_link)
+    if decoded and "google.com" not in decoded:
+        return decoded
+
     try:
         resp = requests.get(google_link, headers=HEADERS, timeout=8, allow_redirects=True)
         html = resp.text
@@ -93,24 +112,28 @@ def resolve_real_url(google_link):
             r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=([^"\']+)["\']',
             html, re.IGNORECASE,
         )
-        if match:
+        if match and "google.com" not in match.group(1):
             return match.group(1)
 
         match = re.search(r'(?:window\.location\.href|window\.location\.replace)\(?=?\s*["\']([^"\']+)["\']', html)
-        if match:
+        if match and "google.com" not in match.group(1):
             return match.group(1)
 
-        match = re.search(r'data-n-au=["\']([^"\']+)["\']', html)
-        if match:
-            return match.group(1)
-
-        return resp.url
+        if "google.com" not in resp.url:
+            return resp.url
     except Exception:
-        return google_link
+        pass
+
+    return None  # не удалось найти настоящую статью
 
 
 def find_meta(article_url):
-    """Пытается найти картинку (og:image) и краткое описание (og:description) статьи."""
+    """Пытается найти картинку (og:image) и краткое описание (og:description) статьи.
+    Если реальный адрес не найден (article_url is None) — ничего не запрашиваем,
+    чтобы не утащить данные самого Google News."""
+    if not article_url:
+        return None, None
+
     image, description = None, None
     try:
         resp = requests.get(article_url, headers=HEADERS, timeout=8)
@@ -132,6 +155,8 @@ def find_meta(article_url):
     except Exception as e:
         logging.info(f"Не удалось получить данные статьи: {e}")
     return image, description
+
+
 
 
 def strip_html(text):
