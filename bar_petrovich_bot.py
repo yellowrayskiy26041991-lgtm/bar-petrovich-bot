@@ -14,6 +14,7 @@
 
 import os
 import re
+import html
 import json
 import time
 import base64
@@ -36,10 +37,22 @@ POSTED_FILE = "posted.json"
 DRAFTS_FILE = "drafts.json"
 OFFSET_FILE = "offset.json"
 
+# Прямые RSS-ленты пивных сайтов — у них настоящие ссылки, картинки и описания
+# "из коробки", без плясок с редиректами Google News.
+DIRECT_FEEDS = [
+    "https://www.hopculture.com/feed/",
+    "https://beertoday.co.uk/feed/",
+    "https://www.goodbeerhunting.com/blog?format=rss",
+    "https://thefullpint.com/feed/",
+    "https://www.canadianbeernews.com/feed/",
+]
+
+# Google News — как дополнительный источник (может быть менее надёжным по картинкам)
 QUERIES = ["пиво новости", "craft beer news", "пивоварня", "крафтовое пиво", "пивной рынок"]
 
 DRAFT_HOUR = 9     # во сколько бот сам присылает пачку черновиков
 NUM_DRAFTS = 5     # сколько черновиков готовить за раз
+DESCRIPTION_MAX_LEN = 400
 # ========================
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -75,12 +88,114 @@ def save_drafts(drafts):
     _save(DRAFTS_FILE, drafts)
 
 
-# ---------- поиск новостей ----------
+# ---------- вспомогательное ----------
+
+def strip_html(text):
+    return re.sub(r"<[^>]+>", "", text or "").strip()
+
+
+def clean_text(text, max_len=None):
+    text = html.unescape(strip_html(text))
+    text = re.sub(r"\s+", " ", text).strip()
+    if max_len and len(text) > max_len:
+        text = text[:max_len].rsplit(" ", 1)[0] + "…"
+    return text
+
 
 def clean_title(title):
-    """Убирает хвост вида ' - Источник' или ' – Источник' из заголовка Google News."""
+    """Убирает хвост вида ' - Источник' или ' – Источник' из заголовка (для Google News)."""
     return re.split(r"\s[-–]\s(?=[^-–]*$)", title)[0].strip()
 
+
+def translate_to_ru(text):
+    """Переводит текст на русский через бесплатный Google Translate endpoint."""
+    if not text:
+        return text
+    try:
+        resp = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={
+                "client": "gtx",
+                "sl": "auto",
+                "tl": "ru",
+                "dt": "t",
+                "q": text,
+            },
+            headers=HEADERS,
+            timeout=8,
+        )
+        data = resp.json()
+        return "".join(chunk[0] for chunk in data[0] if chunk[0])
+    except Exception as e:
+        logging.info(f"Не удалось перевести текст: {e}")
+        return text
+
+
+# ---------- поиск новостей: прямые RSS-ленты (основной источник) ----------
+
+def extract_image_from_entry(entry):
+    # 1) media:content / media:thumbnail (стандартные RSS-теги для картинок)
+    for key in ("media_content", "media_thumbnail"):
+        media = entry.get(key)
+        if media:
+            url = media[0].get("url")
+            if url:
+                return url
+
+    # 2) enclosure с типом image/*
+    for enc in entry.get("links", []):
+        if enc.get("rel") == "enclosure" and "image" in enc.get("type", ""):
+            return enc.get("href")
+
+    # 3) первая картинка внутри полного текста статьи (content:encoded)
+    content_list = entry.get("content")
+    if content_list:
+        match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_list[0].get("value", ""))
+        if match:
+            return match.group(1)
+
+    # 4) картинка внутри summary
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', entry.get("summary", ""))
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def fetch_direct_feed_candidates():
+    posted = load_posted()
+    drafted_links = {d["link"] for d in load_drafts().values()}
+    candidates = []
+
+    for feed_url in DIRECT_FEEDS:
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as e:
+            logging.error(f"Ошибка загрузки ленты {feed_url}: {e}")
+            continue
+
+        for entry in feed.entries:
+            link = entry.get("link")
+            if not link or link in posted or link in drafted_links:
+                continue
+
+            title = clean_text(entry.get("title", ""))
+            description = clean_text(entry.get("summary", ""), DESCRIPTION_MAX_LEN)
+            if description == title:
+                description = ""
+
+            candidates.append({
+                "title": translate_to_ru(title),
+                "link": link,
+                "description": translate_to_ru(description),
+                "image": extract_image_from_entry(entry),
+            })
+
+    random.shuffle(candidates)
+    return candidates
+
+
+# ---------- поиск новостей: Google News (резервный источник) ----------
 
 def decode_google_news_url(google_link):
     """Google News кодирует настоящий адрес статьи в base64 прямо в самой ссылке
@@ -99,71 +214,44 @@ def decode_google_news_url(google_link):
 
 
 def resolve_real_url(google_link):
-    """Разворачивает ссылку Google News до настоящего адреса статьи."""
     decoded = decode_google_news_url(google_link)
     if decoded and "google.com" not in decoded:
         return decoded
-
     try:
         resp = requests.get(google_link, headers=HEADERS, timeout=8, allow_redirects=True)
-        html = resp.text
-
-        match = re.search(
-            r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=([^"\']+)["\']',
-            html, re.IGNORECASE,
-        )
-        if match and "google.com" not in match.group(1):
-            return match.group(1)
-
-        match = re.search(r'(?:window\.location\.href|window\.location\.replace)\(?=?\s*["\']([^"\']+)["\']', html)
-        if match and "google.com" not in match.group(1):
-            return match.group(1)
-
         if "google.com" not in resp.url:
             return resp.url
     except Exception:
         pass
-
-    return None  # не удалось найти настоящую статью
+    return None  # не удалось найти настоящую статью — лучше пропустить, чем взять мусор
 
 
 def find_meta(article_url):
-    """Пытается найти картинку (og:image) и краткое описание (og:description) статьи.
-    Если реальный адрес не найден (article_url is None) — ничего не запрашиваем,
-    чтобы не утащить данные самого Google News."""
+    """og:image и og:description настоящей статьи. Если article_url нет — не запрашиваем ничего."""
     if not article_url:
         return None, None
-
     image, description = None, None
     try:
         resp = requests.get(article_url, headers=HEADERS, timeout=8)
-        html = resp.text
-
+        text = resp.text
         img_match = re.search(
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-            html, re.IGNORECASE,
+            text, re.IGNORECASE,
         )
         if img_match:
             image = img_match.group(1)
-
         desc_match = re.search(
             r'<meta[^>]+(?:property=["\']og:description["\']|name=["\']description["\'])[^>]+content=["\']([^"\']+)["\']',
-            html, re.IGNORECASE,
+            text, re.IGNORECASE,
         )
         if desc_match:
-            description = desc_match.group(1).strip()
+            description = clean_text(desc_match.group(1), DESCRIPTION_MAX_LEN)
     except Exception as e:
         logging.info(f"Не удалось получить данные статьи: {e}")
     return image, description
 
 
-
-
-def strip_html(text):
-    return re.sub(r"<[^>]+>", "", text or "").strip()
-
-
-def search_candidates():
+def fetch_google_news_candidates():
     posted = load_posted()
     drafted_links = {d["link"] for d in load_drafts().values()}
     seen_titles = set()
@@ -182,25 +270,41 @@ def search_candidates():
             if link in posted or link in drafted_links or title in seen_titles:
                 continue
             seen_titles.add(title)
-            rss_summary = strip_html(getattr(entry, "summary", ""))
-            candidates.append({"title": title, "link": link, "rss_summary": rss_summary})
+            candidates.append({"title": title, "link": link})
 
     random.shuffle(candidates)
     return candidates
 
 
-def build_drafts(n=NUM_DRAFTS, max_attempts=15):
-    """Ищет новости и собирает n штук с картинками и описанием (если получится)."""
-    candidates = search_candidates()
-    results = []
-    for item in candidates[:max_attempts]:
-        real_url = resolve_real_url(item["link"])
-        image, description = find_meta(real_url)
-        item["image"] = image
-        item["description"] = description or item.get("rss_summary") or ""
-        results.append(item)
-        if len(results) >= n:
-            break
+def enrich_google_news_item(item, max_attempts_left):
+    real_url = resolve_real_url(item["link"])
+    if not real_url:
+        return None
+    image, description = find_meta(real_url)
+    item["image"] = image
+    item["description"] = translate_to_ru(description) if description else description
+    return item
+
+
+# ---------- сборка черновиков ----------
+
+def build_drafts(n=NUM_DRAFTS, max_google_attempts=10):
+    """Сначала берём проверенные прямые RSS-ленты, при нехватке — добираем из Google News."""
+    results = fetch_direct_feed_candidates()[:n]
+
+    if len(results) < n:
+        gn_candidates = fetch_google_news_candidates()
+        needed = n - len(results)
+        checked = 0
+        for item in gn_candidates:
+            if needed <= 0 or checked >= max_google_attempts:
+                break
+            checked += 1
+            enriched = enrich_google_news_item(item, max_google_attempts - checked)
+            if enriched:
+                results.append(enriched)
+                needed -= 1
+
     return results
 
 
@@ -361,4 +465,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
