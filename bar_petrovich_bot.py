@@ -1,15 +1,12 @@
 """
 Бот для Telegram-канала "Барный Петрович".
+Ищет свежие новости про пиво/крафтовое пивоварение и публикует их
+в канал 3 раза в день в случайное время (с 8:00 до 23:00, ночью не постит).
 
 Как это работает:
-- Раз в день (в DRAFT_HOUR) бот готовит NUM_DRAFTS новостей про пиво, с картинками,
-  и присылает их тебе лично в Телеграм (не в канал!) — каждую с кнопками
-  "Опубликовать" и "Удалить".
-- Ты нажимаешь нужную кнопку под каждым постом:
-    - "Опубликовать" -> бот публикует именно эту новость в канал
-    - "Удалить" -> черновик просто удаляется, в канал не идёт
-- Можно запросить черновики вручную в любой момент, отправив боту в личку
-  команду /drafts.
+- Каждый день в 00:00 бот выбирает 3 случайных времени публикации.
+- В нужный момент берёт свежую (ещё не опубликованную) новость и постит в канал.
+- Уже опубликованные ссылки запоминаются в файле posted.json, чтобы не дублировать.
 """
 
 import os
@@ -28,53 +25,28 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН_ОТ_BOTFATHER")
-CHANNEL = os.getenv("CHANNEL", "@barniy_petrovich")       # канал, куда публикуем
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")             # твой личный Telegram ID
+CHANNEL = os.getenv("CHANNEL", "@barniy_petrovich")  # username канала или числовой ID (-100...)
 
 POSTED_FILE = "posted.json"
-DRAFTS_FILE = "drafts.json"
-OFFSET_FILE = "offset.json"
-
 QUERIES = ["пиво новости", "craft beer news", "пивоварня", "крафтовое пиво", "пивной рынок"]
 
-DRAFT_HOUR = 9     # во сколько бот сам присылает пачку черновиков
-NUM_DRAFTS = 5     # сколько черновиков готовить за раз
+DAY_START_HOUR = 8   # раньше не постим
+DAY_END_HOUR = 23    # позже не постим (ночью — тишина)
+POSTS_PER_DAY = 3
 # ========================
-
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-
-# ---------- хранение данных ----------
-
-def _load(path, default):
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return default
-
-
-def _save(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
 
 
 def load_posted():
-    return set(_load(POSTED_FILE, []))
+    if os.path.exists(POSTED_FILE):
+        with open(POSTED_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
 
 
 def save_posted(posted):
-    _save(POSTED_FILE, list(posted)[-500:])
+    with open(POSTED_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(posted)[-500:], f, ensure_ascii=False)
 
-
-def load_drafts():
-    return _load(DRAFTS_FILE, {})
-
-
-def save_drafts(drafts):
-    _save(DRAFTS_FILE, drafts)
-
-
-# ---------- поиск новостей ----------
 
 def clean_title(title):
     """Убирает хвост вида ' - Источник' или ' – Источник' из заголовка Google News."""
@@ -106,12 +78,9 @@ def find_image(article_url):
     return None
 
 
-def search_candidates():
+def fetch_news():
     posted = load_posted()
-    drafted_links = {d["link"] for d in load_drafts().values()}
-    seen_titles = set()
     candidates = []
-
     for q in QUERIES:
         url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=ru&gl=RU&ceid=RU:ru"
         try:
@@ -121,175 +90,89 @@ def search_candidates():
             continue
         for entry in feed.entries:
             link = entry.link
-            title = clean_title(entry.title)
-            if link in posted or link in drafted_links or title in seen_titles:
-                continue
-            seen_titles.add(title)
-            candidates.append({"title": title, "link": link})
-
+            if link not in posted:
+                candidates.append({
+                    "title": clean_title(entry.title),
+                    "link": link,
+                })
     random.shuffle(candidates)
-    return candidates
+    return candidates, posted
 
 
-def build_drafts(n=NUM_DRAFTS, max_attempts=15):
-    """Ищет новости и собирает n штук с картинками (если получится)."""
-    candidates = search_candidates()
-    results = []
-    for item in candidates[:max_attempts]:
-        real_url = resolve_real_url(item["link"])
-        image = find_image(real_url)
-        item["image"] = image
-        results.append(item)
-        if len(results) >= n:
-            break
-    return results
-
-
-# ---------- отправка сообщений ----------
-
-def tg_call(method, **params):
-    try:
-        resp = requests.post(f"{API}/{method}", data=params, timeout=15)
-        return resp.json()
-    except Exception as e:
-        logging.error(f"Ошибка запроса {method}: {e}")
-        return {}
-
-
-def publish_to_channel(item):
+def send_to_channel(item):
     text = f"🍺 <b>{item['title']}</b>"
-    if item.get("image"):
-        result = tg_call("sendPhoto", chat_id=CHANNEL, photo=item["image"],
-                          caption=text, parse_mode="HTML")
-        if result.get("ok"):
+
+    real_url = resolve_real_url(item["link"])
+    image_url = find_image(real_url)
+
+    if image_url:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+        resp = requests.post(url, data={
+            "chat_id": CHANNEL,
+            "photo": image_url,
+            "caption": text,
+            "parse_mode": "HTML",
+        })
+        if resp.ok:
+            logging.info(f"Опубликовано с картинкой: {item['title']}")
             return True
-        logging.warning(f"Не вышло с картинкой, пробую текстом: {result}")
+        logging.warning(f"Не получилось отправить с картинкой, пробую без: {resp.text}")
 
-    result = tg_call("sendMessage", chat_id=CHANNEL, text=text, parse_mode="HTML")
-    return bool(result.get("ok"))
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    resp = requests.post(url, data={
+        "chat_id": CHANNEL,
+        "text": text,
+        "parse_mode": "HTML",
+    })
+    if resp.ok:
+        logging.info(f"Опубликовано: {item['title']}")
+        return True
+    logging.error(f"Ошибка отправки: {resp.text}")
+    return False
 
 
-def send_draft_to_owner(draft_id, item):
-    if not OWNER_CHAT_ID:
-        logging.error("OWNER_CHAT_ID не задан — некому присылать черновики")
+def post_one():
+    candidates, posted = fetch_news()
+    if not candidates:
+        logging.warning("Нет свежих новостей для публикации")
         return
-    text = f"🍺 <b>{item['title']}</b>"
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Опубликовать", "callback_data": f"pub:{draft_id}"},
-            {"text": "🗑 Удалить", "callback_data": f"del:{draft_id}"},
-        ]]
-    }
-    if item.get("image"):
-        tg_call("sendPhoto", chat_id=OWNER_CHAT_ID, photo=item["image"],
-                caption=text, parse_mode="HTML", reply_markup=json.dumps(keyboard))
-    else:
-        tg_call("sendMessage", chat_id=OWNER_CHAT_ID, text=text,
-                parse_mode="HTML", reply_markup=json.dumps(keyboard))
+    item = candidates[0]
+    if send_to_channel(item):
+        posted.add(item["link"])
+        save_posted(posted)
 
 
-def send_drafts(n=NUM_DRAFTS):
-    items = build_drafts(n)
-    if not items:
-        logging.warning("Не нашлось новых новостей для черновиков")
-        if OWNER_CHAT_ID:
-            tg_call("sendMessage", chat_id=OWNER_CHAT_ID,
-                    text="Не нашлось новых новостей для черновиков 🤷")
-        return
+def plan_today_times():
+    minutes_range = range(DAY_START_HOUR * 60, DAY_END_HOUR * 60)
+    chosen = sorted(random.sample(minutes_range, POSTS_PER_DAY))
+    return [(m // 60, m % 60) for m in chosen]
 
-    drafts = load_drafts()
-    for item in items:
-        draft_id = str(int(time.time() * 1000)) + str(random.randint(10, 99))
-        drafts[draft_id] = item
-        send_draft_to_owner(draft_id, item)
-        time.sleep(1)
-    save_drafts(drafts)
-    logging.info(f"Отправлено {len(items)} черновиков владельцу")
-
-
-# ---------- обработка кнопок и команд ----------
-
-def handle_callback(callback):
-    data = callback.get("data", "")
-    message = callback.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    message_id = message.get("message_id")
-    callback_id = callback.get("id")
-
-    tg_call("answerCallbackQuery", callback_query_id=callback_id)
-
-    if ":" not in data:
-        return
-    action, draft_id = data.split(":", 1)
-    drafts = load_drafts()
-    item = drafts.get(draft_id)
-    if not item:
-        return
-
-    if action == "pub":
-        ok = publish_to_channel(item)
-        result_text = "✅ Опубликовано в канале" if ok else "⚠️ Ошибка публикации, попробуй ещё раз"
-        if ok:
-            posted = load_posted()
-            posted.add(item["link"])
-            save_posted(posted)
-    else:
-        result_text = "🗑 Черновик удалён"
-
-    del drafts[draft_id]
-    save_drafts(drafts)
-
-    caption = f"🍺 <b>{item['title']}</b>\n\n{result_text}"
-    if item.get("image"):
-        tg_call("editMessageCaption", chat_id=chat_id, message_id=message_id,
-                caption=caption, parse_mode="HTML")
-    else:
-        tg_call("editMessageText", chat_id=chat_id, message_id=message_id,
-                text=caption, parse_mode="HTML")
-
-
-def handle_message(message):
-    text = (message.get("text") or "").strip()
-    chat_id = message.get("chat", {}).get("id")
-
-    if text == "/start":
-        tg_call("sendMessage", chat_id=chat_id,
-                text=f"Привет! Твой chat_id: {chat_id}\n"
-                     f"Пропиши его в переменную OWNER_CHAT_ID, чтобы получать черновики постов.")
-    elif text == "/drafts":
-        if OWNER_CHAT_ID and str(chat_id) != str(OWNER_CHAT_ID):
-            tg_call("sendMessage", chat_id=chat_id, text="Эта команда доступна только владельцу бота.")
-            return
-        tg_call("sendMessage", chat_id=chat_id, text="Готовлю черновики, минутку…")
-        send_drafts()
-
-
-def poll_updates():
-    offset = _load(OFFSET_FILE, {}).get("offset", 0)
-    result = tg_call("getUpdates", offset=offset, timeout=20)
-    for update in result.get("result", []):
-        offset = update["update_id"] + 1
-        if "callback_query" in update:
-            handle_callback(update["callback_query"])
-        elif "message" in update:
-            handle_message(update["message"])
-    _save(OFFSET_FILE, {"offset": offset})
-
-
-# ---------- главный цикл ----------
 
 def main():
     logging.info("Бот 'Барный Петрович' запущен")
-    last_draft_date = None
+    current_day = None
+    today_times = []
+    done_today = set()
 
     while True:
         now = datetime.now()
+        if current_day != now.date():
+            current_day = now.date()
+            today_times = plan_today_times()
+            done_today = set()
+            readable = [f"{h:02d}:{m:02d}" for h, m in today_times]
+            logging.info(f"План публикаций на {current_day}: {readable}")
 
-        if now.hour == DRAFT_HOUR and last_draft_date != now.date():
-            send_drafts()
-            last_draft_date = now.date()
+        for t in today_times:
+            if t not in done_today and (now.hour, now.minute) == t:
+                post_one()
+                done_today.add(t)
 
-        poll_updates()  # тут же ловим долгий poll (до 20 сек), поэтому отдельный sleep не нужен
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
