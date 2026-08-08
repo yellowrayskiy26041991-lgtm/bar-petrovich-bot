@@ -32,6 +32,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН_ОТ_BOTFATHER")
 CHANNEL = os.getenv("CHANNEL", "@barniy_petrovich")       # канал, куда публикуем
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "")             # твой личный Telegram ID
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")          # ключ для поиска видео на YouTube
 
 POSTED_FILE = "posted.json"
 DRAFTS_FILE = "drafts.json"
@@ -50,8 +51,11 @@ DIRECT_FEEDS = [
 # Google News — как дополнительный источник (может быть менее надёжным по картинкам)
 QUERIES = ["пиво новости", "craft beer news", "пивоварня", "крафтовое пиво", "пивной рынок"]
 
-DRAFT_HOUR = 9     # во сколько бот сам присылает пачку черновиков
-NUM_DRAFTS = 5     # сколько черновиков готовить за раз
+YOUTUBE_QUERIES = ["beer shorts", "craft beer", "beer review shorts"]
+
+DRAFT_HOUR = 9        # во сколько бот сам присылает пачку черновиков
+NUM_DRAFTS = 5        # сколько новостей готовить за раз
+NUM_VIDEO_DRAFTS = 2  # сколько видео добавлять к пачке
 DESCRIPTION_MAX_LEN = 700
 # ========================
 
@@ -296,6 +300,61 @@ def enrich_google_news_item(item, max_attempts_left):
     return item
 
 
+# ---------- поиск видео: YouTube (официальный API) ----------
+
+def fetch_youtube_candidates():
+    if not YOUTUBE_API_KEY:
+        logging.info("YOUTUBE_API_KEY не задан — пропускаю поиск видео")
+        return []
+
+    posted = load_posted()
+    drafted_links = {d["link"] for d in load_drafts().values()}
+    candidates = []
+
+    for q in YOUTUBE_QUERIES:
+        try:
+            resp = requests.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
+                    "part": "snippet",
+                    "q": q,
+                    "type": "video",
+                    "videoDuration": "short",   # короткие ролики, ближе всего к Shorts
+                    "order": "date",
+                    "maxResults": 10,
+                    "key": YOUTUBE_API_KEY,
+                },
+                timeout=10,
+            )
+            data = resp.json()
+        except Exception as e:
+            logging.error(f"Ошибка запроса к YouTube по '{q}': {e}")
+            continue
+
+        if "error" in data:
+            logging.error(f"YouTube API вернул ошибку: {data['error']}")
+            continue
+
+        for item in data.get("items", []):
+            video_id = item.get("id", {}).get("videoId")
+            if not video_id:
+                continue
+            link = f"https://www.youtube.com/shorts/{video_id}"
+            if link in posted or link in drafted_links:
+                continue
+            title = clean_text(item.get("snippet", {}).get("title", ""))
+            candidates.append({
+                "type": "video",
+                "title": translate_to_ru(title),
+                "link": link,
+                "description": "",
+                "image": None,
+            })
+
+    random.shuffle(candidates)
+    return candidates
+
+
 # ---------- сборка черновиков ----------
 
 def build_drafts(n=NUM_DRAFTS, max_google_attempts=10):
@@ -315,6 +374,9 @@ def build_drafts(n=NUM_DRAFTS, max_google_attempts=10):
                 results.append(enriched)
                 needed -= 1
 
+    videos = fetch_youtube_candidates()[:NUM_VIDEO_DRAFTS]
+    results.extend(videos)
+
     return results
 
 
@@ -330,6 +392,8 @@ def tg_call(method, **params):
 
 
 def build_post_text(item):
+    if item.get("type") == "video":
+        return f"🎬 <b>{item['title']}</b>\n\n{item['link']}"
     text = f"🍺 <b>{item['title']}</b>"
     description = item.get("description")
     if description:
@@ -339,6 +403,11 @@ def build_post_text(item):
 
 def publish_to_channel(item):
     text = build_post_text(item)
+
+    if item.get("type") == "video":
+        result = tg_call("sendMessage", chat_id=CHANNEL, text=text, parse_mode="HTML")
+        return bool(result.get("ok"))
+
     if item.get("image"):
         result = tg_call("sendPhoto", chat_id=CHANNEL, photo=item["image"],
                           caption=text, parse_mode="HTML")
@@ -361,7 +430,11 @@ def send_draft_to_owner(draft_id, item):
             {"text": "🗑 Удалить", "callback_data": f"del:{draft_id}"},
         ]]
     }
-    if item.get("image"):
+
+    if item.get("type") == "video":
+        tg_call("sendMessage", chat_id=OWNER_CHAT_ID, text=text,
+                parse_mode="HTML", reply_markup=json.dumps(keyboard))
+    elif item.get("image"):
         tg_call("sendPhoto", chat_id=OWNER_CHAT_ID, photo=item["image"],
                 caption=text, parse_mode="HTML", reply_markup=json.dumps(keyboard))
     else:
